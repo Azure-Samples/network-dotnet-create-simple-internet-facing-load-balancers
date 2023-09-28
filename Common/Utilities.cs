@@ -71,6 +71,29 @@ namespace Azure.ResourceManager.Samples.Common
             return list;
         }
 
+        public static async Task<NetworkInterfaceResource> CreateNetworkInterface(ResourceGroupResource resourceGroup, VirtualNetworkResource vnet, string networkInterfaceName = null)
+        {
+            networkInterfaceName = string.IsNullOrEmpty(networkInterfaceName) ? CreateRandomName("nic") : networkInterfaceName;
+            var nicInput = new NetworkInterfaceData()
+            {
+                Location = resourceGroup.Data.Location,
+                IPConfigurations =
+                    {
+                        new NetworkInterfaceIPConfigurationData()
+                        {
+                            Name = "default-config",
+                            PrivateIPAllocationMethod = NetworkIPAllocationMethod.Dynamic,
+                            Subnet = new SubnetData()
+                            {
+                                Id = vnet.Data.Subnets.First().Id
+                            }
+                        }
+                    }
+            };
+            var networkInterfaceLro = await resourceGroup.GetNetworkInterfaces().CreateOrUpdateAsync(WaitUntil.Completed, networkInterfaceName, nicInput);
+            return networkInterfaceLro.Value;
+        }
+
         public static VirtualMachineData GetDefaultVMInputData(ResourceGroupResource resourceGroup, string vmName) =>
             new VirtualMachineData(resourceGroup.Data.Location)
             {
