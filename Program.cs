@@ -1,24 +1,30 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using Microsoft.Azure.Management.Compute.Fluent;
-using Microsoft.Azure.Management.Compute.Fluent.Models;
-using Microsoft.Azure.Management.Fluent;
-using Microsoft.Azure.Management.Network.Fluent;
-using Microsoft.Azure.Management.Network.Fluent.Models;
-using Microsoft.Azure.Management.ResourceManager.Fluent;
-using Microsoft.Azure.Management.ResourceManager.Fluent.Core;
-using Microsoft.Azure.Management.ResourceManager.Fluent.Core.ResourceActions;
-using Microsoft.Azure.Management.Samples.Common;
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
+using Azure;
+using Azure.Core;
+using Azure.Identity;
+using Azure.ResourceManager.Resources.Models;
+using Azure.ResourceManager.Samples.Common;
+using Azure.ResourceManager.Resources;
+using Azure.ResourceManager;
+using Azure.ResourceManager.Network;
+using Azure.ResourceManager.Network.Models;
+using Azure.ResourceManager.Storage.Models;
+using Azure.ResourceManager.Storage;
+using Microsoft.Identity.Client.Extensions.Msal;
+using Azure.ResourceManager.Compute.Models;
+using Azure.ResourceManager.Compute;
+using System.Xml.Linq;
+using Microsoft.Extensions.Azure;
+using System.Reflection.PortableExecutable;
 
 namespace CreateSimpleInternetFacingLoadBalancer
 {
 
     public class Program
     {
+        private static ResourceIdentifier? _resourceGroupId = null;
         /**
          * Azure Network sample for creating a simple Internet facing load balancer -
          *
@@ -42,37 +48,61 @@ namespace CreateSimpleInternetFacingLoadBalancer
          * Delete the load balancer
          */
 
-        public static void RunSample(IAzure azure)
+        public static async Task RunSample(ArmClient client)
         {
-            string rgName = SdkContext.RandomResourceName("rg", 15);
-            string vnetName = SdkContext.RandomResourceName("vnet", 24);
-            Region region = Region.USEast;
-            string loadBalancerName = SdkContext.RandomResourceName("lb", 18);
-            string publicIpName = SdkContext.RandomResourceName("pip", 18);
-            string availSetName = SdkContext.RandomResourceName("av", 24);
+            string rgName = Utilities.CreateRandomName("NetworkSampleRG");
+            string vnetName = Utilities.CreateRandomName("vnet");
+            string loadBalancerName = Utilities.CreateRandomName("lb");
+            string publicIpName = Utilities.CreateRandomName("pip");
+            string availSetName = Utilities.CreateRandomName("av");
             string httpLoadBalancingRuleName = "httpRule";
-            string userName = Utilities.CreateUsername();
-            string sshKey = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCfSPC2K7LZcFKEO+/t3dzmQYtrJFZNxOsbVgOVKietqHyvmYGHEC0J2wPdAqQ/63g/hhAEFRoyehM+rbeDri4txB3YFfnOK58jqdkyXzupWqXzOrlKY4Wz9SKjjN765+dqUITjKRIaAip1Ri137szRg71WnrmdP3SphTRlCx1Bk2nXqWPsclbRDCiZeF8QOTi4JqbmJyK5+0UqhqYRduun8ylAwKKQJ1NJt85sYIHn9f1Rfr6Tq2zS0wZ7DHbZL+zB5rSlAr8QyUdg/GQD+cmSs6LvPJKL78d6hMGk84ARtFo4A79ovwX/Fj01znDQkU6nJildfkaolH2rWFG/qttD azjava@javalib.com";
 
             try
             {
+                // Get default subscription
+                SubscriptionResource subscription = await client.GetDefaultSubscriptionAsync();
+
+                // Create a resource group in the EastUS region
+                Utilities.Log($"Creating resource group...");
+                ArmOperation<ResourceGroupResource> rgLro = await subscription.GetResourceGroups().CreateOrUpdateAsync(WaitUntil.Completed, rgName, new ResourceGroupData(AzureLocation.WestUS));
+                ResourceGroupResource resourceGroup = rgLro.Value;
+                _resourceGroupId = resourceGroup.Id;
+                Utilities.Log("Created a resource group with name: " + resourceGroup.Data.Name);
+
                 //=============================================================
                 // Define a common availability set for the backend virtual machines
 
-                ICreatable<IAvailabilitySet> availabilitySetDefinition = azure.AvailabilitySets.Define(availSetName)
-                    .WithRegion(region)
-                    .WithNewResourceGroup(rgName)
-                    .WithSku(AvailabilitySetSkuTypes.Aligned);
+                Utilities.Log("Creating an availability set ...");
 
+                AvailabilitySetData availabilitySetInput = new AvailabilitySetData(resourceGroup.Data.Location)
+                {
+                    PlatformFaultDomainCount = 1,
+                    PlatformUpdateDomainCount = 1,
+                    Sku = new ComputeSku()
+                    {
+                        Name = "Aligned",
+                    }
+                };
+                var availabilitySetLro = await resourceGroup.GetAvailabilitySets().CreateOrUpdateAsync(WaitUntil.Completed, availSetName, availabilitySetInput);
+                AvailabilitySetResource availabilitySet = availabilitySetLro.Value;
+                Utilities.Log($"Created first availability set: {availabilitySet.Data.Name}");
 
                 //=============================================================
                 // Define a common virtual network for the virtual machines
 
-                ICreatable<INetwork> networkDefinition = azure.Networks.Define(vnetName)
-                        .WithRegion(region)
-                        .WithNewResourceGroup(rgName)
-                        .WithAddressSpace("10.0.0.0/28");
-
+                Utilities.Log("Creating virtual network...");
+                VirtualNetworkData vnetInput = new VirtualNetworkData()
+                {
+                    Location = resourceGroup.Data.Location,
+                    AddressPrefixes = { "10.0.0.0/28" },
+                    Subnets =
+                    {
+                        new SubnetData() { Name = "default", AddressPrefix = "10.0.0.8/29"},
+                    },
+                };
+                var vnetLro = await resourceGroup.GetVirtualNetworks().CreateOrUpdateAsync(WaitUntil.Completed, vnetName, vnetInput);
+                VirtualNetworkResource vnet = vnetLro.Value;
+                Utilities.Log($"Created a virtual network: {vnet.Data.Name}");
 
                 //=============================================================
                 // Create two virtual machines for the backend of the load balancer
@@ -85,7 +115,7 @@ namespace CreateSimpleInternetFacingLoadBalancer
                 for (int i = 0; i < 2; i++)
                 {
                     virtualMachineDefinitions.Add(
-                            azure.VirtualMachines.Define(SdkContext.RandomResourceName("vm", 24))
+                            azure.VirtualMachines.Define(Utilities.CreateRandomName("vm", 24))
                                 .WithRegion(region)
                                 .WithExistingResourceGroup(rgName)
                                 .WithNewPrimaryNetwork(networkDefinition)
@@ -179,8 +209,12 @@ namespace CreateSimpleInternetFacingLoadBalancer
             {
                 try
                 {
-                    Utilities.Log("Starting the deletion of the resource group: " + rgName);
-                    azure.ResourceGroups.BeginDeleteByName(rgName);
+                    if (_resourceGroupId is not null)
+                    {
+                        Utilities.Log($"Deleting Resource Group...");
+                        await client.GetResourceGroupResource(_resourceGroupId).DeleteAsync(WaitUntil.Completed);
+                        Utilities.Log($"Deleted Resource Group: {_resourceGroupId.Name}");
+                    }
                 }
                 catch (NullReferenceException)
                 {
@@ -193,24 +227,20 @@ namespace CreateSimpleInternetFacingLoadBalancer
             }
         }
 
-        public static void Main(string[] args)
+        public static async Task Main(string[] args)
         {
             try
             {
                 //=================================================================
                 // Authenticate
-                var credentials = SdkContext.AzureCredentialsFactory.FromFile(Environment.GetEnvironmentVariable("AZURE_AUTH_LOCATION"));
+                var clientId = Environment.GetEnvironmentVariable("CLIENT_ID");
+                var clientSecret = Environment.GetEnvironmentVariable("CLIENT_SECRET");
+                var tenantId = Environment.GetEnvironmentVariable("TENANT_ID");
+                var subscription = Environment.GetEnvironmentVariable("SUBSCRIPTION_ID");
+                ClientSecretCredential credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+                ArmClient client = new ArmClient(credential, subscription);
 
-                var azure = Azure
-                    .Configure()
-                    .WithLogLevel(HttpLoggingDelegatingHandler.Level.Basic)
-                    .Authenticate(credentials)
-                    .WithDefaultSubscription();
-
-                // Print selected subscription
-                Utilities.Log("Selected subscription: " + azure.SubscriptionId);
-
-                RunSample(azure);
+                await RunSample(client);
             }
             catch (Exception ex)
             {
