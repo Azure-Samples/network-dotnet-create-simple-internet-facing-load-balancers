@@ -1,24 +1,23 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using Microsoft.Azure.Management.Compute.Fluent;
-using Microsoft.Azure.Management.Compute.Fluent.Models;
-using Microsoft.Azure.Management.Fluent;
-using Microsoft.Azure.Management.Network.Fluent;
-using Microsoft.Azure.Management.Network.Fluent.Models;
-using Microsoft.Azure.Management.ResourceManager.Fluent;
-using Microsoft.Azure.Management.ResourceManager.Fluent.Core;
-using Microsoft.Azure.Management.ResourceManager.Fluent.Core.ResourceActions;
-using Microsoft.Azure.Management.Samples.Common;
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
+using Azure;
+using Azure.Core;
+using Azure.Identity;
+using Azure.ResourceManager.Samples.Common;
+using Azure.ResourceManager.Resources;
+using Azure.ResourceManager;
+using Azure.ResourceManager.Network;
+using Azure.ResourceManager.Network.Models;
+using Azure.ResourceManager.Compute.Models;
+using Azure.ResourceManager.Compute;
 
 namespace CreateSimpleInternetFacingLoadBalancer
 {
 
     public class Program
     {
+        private static ResourceIdentifier? _resourceGroupId = null;
         /**
          * Azure Network sample for creating a simple Internet facing load balancer -
          *
@@ -42,37 +41,66 @@ namespace CreateSimpleInternetFacingLoadBalancer
          * Delete the load balancer
          */
 
-        public static void RunSample(IAzure azure)
+        public static async Task RunSample(ArmClient client)
         {
-            string rgName = SdkContext.RandomResourceName("rg", 15);
-            string vnetName = SdkContext.RandomResourceName("vnet", 24);
-            Region region = Region.USEast;
-            string loadBalancerName = SdkContext.RandomResourceName("lb", 18);
-            string publicIpName = SdkContext.RandomResourceName("pip", 18);
-            string availSetName = SdkContext.RandomResourceName("av", 24);
+            string rgName = Utilities.CreateRandomName("NetworkSampleRG");
+            string vnetName = Utilities.CreateRandomName("vnet");
+            string loadBalancerName = Utilities.CreateRandomName("lb");
+            string publicIpName = Utilities.CreateRandomName("pip");
+            string availSetName = Utilities.CreateRandomName("av");
+            string vmName1 = Utilities.CreateRandomName("vm1-");
+            string vmName2 = Utilities.CreateRandomName("vm2-");
             string httpLoadBalancingRuleName = "httpRule";
-            string userName = Utilities.CreateUsername();
-            string sshKey = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCfSPC2K7LZcFKEO+/t3dzmQYtrJFZNxOsbVgOVKietqHyvmYGHEC0J2wPdAqQ/63g/hhAEFRoyehM+rbeDri4txB3YFfnOK58jqdkyXzupWqXzOrlKY4Wz9SKjjN765+dqUITjKRIaAip1Ri137szRg71WnrmdP3SphTRlCx1Bk2nXqWPsclbRDCiZeF8QOTi4JqbmJyK5+0UqhqYRduun8ylAwKKQJ1NJt85sYIHn9f1Rfr6Tq2zS0wZ7DHbZL+zB5rSlAr8QyUdg/GQD+cmSs6LvPJKL78d6hMGk84ARtFo4A79ovwX/Fj01znDQkU6nJildfkaolH2rWFG/qttD azjava@javalib.com";
+            string frontendName = loadBalancerName + "-FE";
+            string backendPoolName = loadBalancerName + "-BAP";
+            string httpProbe = "httpProbe";
 
             try
             {
+                // Get default subscription
+                SubscriptionResource subscription = await client.GetDefaultSubscriptionAsync();
+
+                // Create a resource group in the EastUS region
+                Utilities.Log($"Creating resource group...");
+                ArmOperation<ResourceGroupResource> rgLro = await subscription.GetResourceGroups().CreateOrUpdateAsync(WaitUntil.Completed, rgName, new ResourceGroupData(AzureLocation.WestUS));
+                ResourceGroupResource resourceGroup = rgLro.Value;
+                _resourceGroupId = resourceGroup.Id;
+                Utilities.Log("Created a resource group with name: " + resourceGroup.Data.Name);
+
                 //=============================================================
                 // Define a common availability set for the backend virtual machines
 
-                ICreatable<IAvailabilitySet> availabilitySetDefinition = azure.AvailabilitySets.Define(availSetName)
-                    .WithRegion(region)
-                    .WithNewResourceGroup(rgName)
-                    .WithSku(AvailabilitySetSkuTypes.Aligned);
+                Utilities.Log("Creating an availability set ...");
 
+                AvailabilitySetData availabilitySetInput = new AvailabilitySetData(resourceGroup.Data.Location)
+                {
+                    PlatformFaultDomainCount = 1,
+                    PlatformUpdateDomainCount = 1,
+                    Sku = new ComputeSku()
+                    {
+                        Name = "Aligned",
+                    }
+                };
+                var availabilitySetLro = await resourceGroup.GetAvailabilitySets().CreateOrUpdateAsync(WaitUntil.Completed, availSetName, availabilitySetInput);
+                AvailabilitySetResource availabilitySet = availabilitySetLro.Value;
+                Utilities.Log($"Created first availability set: {availabilitySet.Data.Name}");
 
                 //=============================================================
                 // Define a common virtual network for the virtual machines
 
-                ICreatable<INetwork> networkDefinition = azure.Networks.Define(vnetName)
-                        .WithRegion(region)
-                        .WithNewResourceGroup(rgName)
-                        .WithAddressSpace("10.0.0.0/28");
-
+                Utilities.Log("Creating virtual network...");
+                VirtualNetworkData vnetInput = new VirtualNetworkData()
+                {
+                    Location = resourceGroup.Data.Location,
+                    AddressPrefixes = { "172.16.0.0/16" },
+                    Subnets =
+                    {
+                        new SubnetData() { Name = "Front-end", AddressPrefix = "172.16.1.0/24"},
+                    },
+                };
+                var vnetLro = await resourceGroup.GetVirtualNetworks().CreateOrUpdateAsync(WaitUntil.Completed, vnetName, vnetInput);
+                VirtualNetworkResource vnet = vnetLro.Value;
+                Utilities.Log($"Created a virtual network: {vnet.Data.Name}");
 
                 //=============================================================
                 // Create two virtual machines for the backend of the load balancer
@@ -80,39 +108,23 @@ namespace CreateSimpleInternetFacingLoadBalancer
                 Utilities.Log("Creating two virtual machines in the frontend subnet ...\n"
                         + "and putting them in the shared availability set and virtual network.");
 
-                List<ICreatable<IVirtualMachine>> virtualMachineDefinitions = new List<ICreatable<IVirtualMachine>>();
+                // Create vm1
+                Utilities.Log("Creating a new virtual machine...");
+                NetworkInterfaceResource nic1 = await Utilities.CreateNetworkInterface(resourceGroup, vnet);
+                VirtualMachineData vmInput1 = Utilities.GetDefaultVMInputData(resourceGroup, vmName1);
+                vmInput1.NetworkProfile.NetworkInterfaces.Add(new VirtualMachineNetworkInterfaceReference() { Id = nic1.Id, Primary = true });
+                var vmLro1 = await resourceGroup.GetVirtualMachines().CreateOrUpdateAsync(WaitUntil.Completed, vmName1, vmInput1);
+                VirtualMachineResource vm1 = vmLro1.Value;
+                Utilities.Log($"Created virtual machine: {vm1.Data.Name}");
 
-                for (int i = 0; i < 2; i++)
-                {
-                    virtualMachineDefinitions.Add(
-                            azure.VirtualMachines.Define(SdkContext.RandomResourceName("vm", 24))
-                                .WithRegion(region)
-                                .WithExistingResourceGroup(rgName)
-                                .WithNewPrimaryNetwork(networkDefinition)
-                                .WithPrimaryPrivateIPAddressDynamic()
-                                .WithoutPrimaryPublicIPAddress()
-                                .WithPopularLinuxImage(KnownLinuxVirtualMachineImage.UbuntuServer16_04_Lts)
-                                .WithRootUsername(userName)
-                                .WithSsh(sshKey)
-                                .WithSize(VirtualMachineSizeTypes.Parse("Standard_D2a_v4"))
-                                .WithNewAvailabilitySet(availabilitySetDefinition));
-                }
-
-
-                Stopwatch stopwatch = Stopwatch.StartNew();
-
-                // Create and retrieve the VMs by the interface accepted by the load balancing rule
-                var virtualMachines = azure.VirtualMachines.Create(virtualMachineDefinitions);
-
-                stopwatch.Stop();
-                Utilities.Log("Created 2 Linux VMs: (took " + (stopwatch.ElapsedMilliseconds / 1000) + " seconds)\n");
-
-                // Print virtual machine details
-                foreach(var vm in virtualMachines)
-                {
-                    Utilities.PrintVirtualMachine((IVirtualMachine)vm);
-                }
-
+                // Create vm2
+                Utilities.Log("Creating a new virtual machine...");
+                NetworkInterfaceResource nic2 = await Utilities.CreateNetworkInterface(resourceGroup, vnet);
+                VirtualMachineData vmInput2 = Utilities.GetDefaultVMInputData(resourceGroup, vmName2);
+                vmInput2.NetworkProfile.NetworkInterfaces.Add(new VirtualMachineNetworkInterfaceReference() { Id = nic2.Id, Primary = true });
+                var vmLro2 = await resourceGroup.GetVirtualMachines().CreateOrUpdateAsync(WaitUntil.Completed, vmName2, vmInput2);
+                VirtualMachineResource vm2 = vmLro2.Value;
+                Utilities.Log($"Created virtual machine: {vm2.Data.Name}");
 
                 //=============================================================
                 // Create an Internet facing load balancer
@@ -127,60 +139,119 @@ namespace CreateSimpleInternetFacingLoadBalancer
                         + "- One load balancing rule for HTTP, mapping public ports on the load\n"
                         + "  balancer to ports in the backend address pool");
 
-                var loadBalancer = azure.LoadBalancers.Define(loadBalancerName)
-                        .WithRegion(region)
-                        .WithExistingResourceGroup(rgName)
+                var frontendIPConfigurationId = new ResourceIdentifier($"{resourceGroup.Id}/providers/Microsoft.Network/loadBalancers/{loadBalancerName}/frontendIPConfigurations/{frontendName}");
+                var backendAddressPoolId = new ResourceIdentifier($"{resourceGroup.Id}/providers/Microsoft.Network/loadBalancers/{loadBalancerName}/backendAddressPools/{backendPoolName}");
+                LoadBalancerData loadBalancerInput = new LoadBalancerData()
+                {
+                    Location = resourceGroup.Data.Location,
+                    Sku = new LoadBalancerSku()
+                    {
+                        Name = LoadBalancerSkuName.Standard,
+                        Tier = LoadBalancerSkuTier.Regional,
+                    },
+                    // Explicitly define the frontend
+                    FrontendIPConfigurations =
+                    {
+                        new FrontendIPConfigurationData()
+                        {
+                            Name = frontendName,
+                            PrivateIPAllocationMethod = NetworkIPAllocationMethod.Dynamic,
+                            Subnet = new SubnetData()
+                            {
+                                Id = vnet.Data.Subnets[0].Id
+                            }
+                        }
+                    },
+                    BackendAddressPools =
+                    {
+                        new BackendAddressPoolData()
+                        {
+                            Name = backendPoolName
+                        }
+                    },
+                    // Add two rules that uses above backend and probe
+                    LoadBalancingRules =
+                    {
+                        // Add a load balancing rule 
+                        new LoadBalancingRuleData()
+                        {
+                            Name = httpLoadBalancingRuleName,
+                            FrontendIPConfigurationId = frontendIPConfigurationId,
+                            BackendAddressPoolId = backendAddressPoolId,
+                            Protocol = LoadBalancingTransportProtocol.Tcp,
+                            FrontendPort = 80,
+                            BackendPort = 80,
+                            EnableFloatingIP = false,
+                            IdleTimeoutInMinutes = 15,
+                            ProbeId = new ResourceIdentifier($"{resourceGroup.Id}/providers/Microsoft.Network/loadBalancers/{loadBalancerName}/probes/{httpProbe}"),
+                        }
+                    },
+                    // Add two probes one per rule
+                    Probes =
+                    {
+                        new ProbeData()
+                        {
+                            Name = httpProbe,
+                            Protocol = ProbeProtocol.Http,
+                            Port = 80,
+                            IntervalInSeconds = 10,
+                            NumberOfProbes = 2,
+                            RequestPath = "/",
+                        }
+                    },
+                };
+                var loadBalancerLro = await resourceGroup.GetLoadBalancers().CreateOrUpdateAsync(WaitUntil.Completed, loadBalancerName, loadBalancerInput);
+                LoadBalancerResource loadBalancer = loadBalancerLro.Value;
+                Utilities.Log($"Created a load balancer: {loadBalancer.Data.Name}");
 
-                        // Add a load balancing rule sending traffic from an implicitly created frontend with the public IP address
-                        // to an implicitly created backend with the two virtual machines
-                        .DefineLoadBalancingRule(httpLoadBalancingRuleName)
-                            .WithProtocol(TransportProtocol.Tcp)
-                            .FromNewPublicIPAddress(publicIpName)
-                            .FromFrontendPort(80)
-                            .ToExistingVirtualMachines(new List<IHasNetworkInterfaces>(virtualMachines))   // Convert VMs to the expected interface
-                            .Attach()
-
-                        .Create();
-
-                // Print load balancer details
-                Utilities.Log("Created a load balancer");
-                Utilities.PrintLoadBalancer(loadBalancer);
-
+                // Update nic to enable load balancer for vm
+                Utilities.Log("Enable load balancer...");
+                NetworkInterfaceData updateNicInput1 = nic1.Data;
+                updateNicInput1.IPConfigurations.First().LoadBalancerBackendAddressPools.Add(new BackendAddressPoolData() { Id = backendAddressPoolId });
+                _ = await resourceGroup.GetNetworkInterfaces().CreateOrUpdateAsync(WaitUntil.Completed, nic1.Data.Name, updateNicInput1);
+                
+                NetworkInterfaceData updateNicInput2 = nic2.Data;
+                updateNicInput2.IPConfigurations.First().LoadBalancerBackendAddressPools.Add(new BackendAddressPoolData() { Id = backendAddressPoolId });
+                _ = await resourceGroup.GetNetworkInterfaces().CreateOrUpdateAsync(WaitUntil.Completed, nic2.Data.Name, updateNicInput2);
 
                 //=============================================================
                 // Update a load balancer with 15 minute idle time for the load balancing rule
 
                 Utilities.Log("Updating the load balancer ...");
 
-                loadBalancer.Update()
-                        .UpdateLoadBalancingRule(httpLoadBalancingRuleName)
-                            .WithIdleTimeoutInMinutes(15)
-                            .Parent()
-                        .Apply();
+                LoadBalancerData updateLoadBalancerInput = loadBalancer.Data;
+                updateLoadBalancerInput.LoadBalancingRules.First(item => item.Name == httpLoadBalancingRuleName).IdleTimeoutInMinutes = 15;
+                loadBalancerLro = await resourceGroup.GetLoadBalancers().CreateOrUpdateAsync(WaitUntil.Completed, loadBalancerName, loadBalancerInput);
+                loadBalancer = loadBalancerLro.Value;
 
                 Utilities.Log("Updated the load balancer with a TCP idle timeout to 15 minutes");
-
 
                 //=============================================================
                 // Show the load balancer info
 
-                Utilities.PrintLoadBalancer(loadBalancer);
-
+                Utilities.Log("Name: " + loadBalancer.Data.Name);
+                Utilities.Log("LoadBalancingRules: " + loadBalancer.Data.LoadBalancingRules.Count);
+                Utilities.Log("Probes: " + loadBalancer.Data.Probes.Count);
+                Utilities.Log("FrontendIPConfigurations: " + loadBalancer.Data.FrontendIPConfigurations.Count);
+                Utilities.Log("BackendAddressPools: " + loadBalancer.Data.BackendAddressPools.Count);
 
                 //=============================================================
                 // Remove a load balancer
 
-                Utilities.Log("Deleting load balancer " + loadBalancerName
-                        + "(" + loadBalancer.Id + ")");
-                azure.LoadBalancers.DeleteById(loadBalancer.Id);
+                Utilities.Log("Deleting load balancer... ");
+                await loadBalancer.DeleteAsync(WaitUntil.Completed);
                 Utilities.Log("Deleted load balancer" + loadBalancerName);
             }
             finally
             {
                 try
                 {
-                    Utilities.Log("Starting the deletion of the resource group: " + rgName);
-                    azure.ResourceGroups.BeginDeleteByName(rgName);
+                    if (_resourceGroupId is not null)
+                    {
+                        Utilities.Log($"Deleting Resource Group...");
+                        await client.GetResourceGroupResource(_resourceGroupId).DeleteAsync(WaitUntil.Completed);
+                        Utilities.Log($"Deleted Resource Group: {_resourceGroupId.Name}");
+                    }
                 }
                 catch (NullReferenceException)
                 {
@@ -193,24 +264,20 @@ namespace CreateSimpleInternetFacingLoadBalancer
             }
         }
 
-        public static void Main(string[] args)
+        public static async Task Main(string[] args)
         {
             try
             {
                 //=================================================================
                 // Authenticate
-                var credentials = SdkContext.AzureCredentialsFactory.FromFile(Environment.GetEnvironmentVariable("AZURE_AUTH_LOCATION"));
+                var clientId = Environment.GetEnvironmentVariable("CLIENT_ID");
+                var clientSecret = Environment.GetEnvironmentVariable("CLIENT_SECRET");
+                var tenantId = Environment.GetEnvironmentVariable("TENANT_ID");
+                var subscription = Environment.GetEnvironmentVariable("SUBSCRIPTION_ID");
+                ClientSecretCredential credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+                ArmClient client = new ArmClient(credential, subscription);
 
-                var azure = Azure
-                    .Configure()
-                    .WithLogLevel(HttpLoggingDelegatingHandler.Level.Basic)
-                    .Authenticate(credentials)
-                    .WithDefaultSubscription();
-
-                // Print selected subscription
-                Utilities.Log("Selected subscription: " + azure.SubscriptionId);
-
-                RunSample(azure);
+                await RunSample(client);
             }
             catch (Exception ex)
             {
